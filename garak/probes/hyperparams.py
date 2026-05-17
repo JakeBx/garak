@@ -37,8 +37,11 @@ Further info:
 
 import copy
 import itertools
+import json
 import logging
+import pathlib
 import random
+from datetime import datetime
 from typing import Iterable
 
 import numpy as np
@@ -109,14 +112,12 @@ class HyperparamBasher(garak.probes.Probe):
 
     * ``attempt.notes["hyperparam_combo"]`` – the params applied this attempt
     * ``attempt.notes["hyperparam_original"]`` – the pre-sweep original values
-    * ``attempt.notes["hyperparam_detector_results"]`` – per-output detection
-      scores written by ``_summarise_by_combo`` at the end of ``probe()``;
-      these survive JSONL serialisation because ``attempt.notes`` is not
-      overwritten by the harness (unlike ``attempt.detector_results``)
 
-    A per-combo pass/fail breakdown is printed to the terminal and logged at
-    ``INFO`` level at the end of each run so results are visible without
-    post-processing the JSONL report.
+    A sidecar ``<run>.hyperparam_index.json`` file is written alongside the
+    JSONL report mapping each parameter combo to the attempt UUIDs that used
+    it.  Run ``python -m garak.analyze.hyperparam_summary --report <report>``
+    after the run to produce a per-combo pass/fail summary from the harness
+    detector results.
 
     Because generator state is mutated between attempts, parallel execution is
     disabled; see ``parallelisable_attempts``.
@@ -366,64 +367,55 @@ class HyperparamBasher(garak.probes.Probe):
                 setattr(self.generator, param, value)
         return attempt
 
-    def _summarise_by_combo(self, attempts: list[Attempt]) -> None:
-        """Run primary detector once across all completed attempts.
+    def _resolve_combo_index_path(self) -> pathlib.Path:
+        """Return the path for the sidecar combo index JSON file.
 
-        Logs a per-combo pass/fail summary and stores per-attempt detection
-        results in ``attempt.notes["hyperparam_detector_results"]`` so they
-        survive into the JSONL report (attempt entries are serialised before
-        harness detection runs, so ``attempt.detector_results`` is always empty
-        at that point).
-
-        The harness will re-run detection after ``probe()`` returns; results are
-        identical for deterministic detectors so double detection is idempotent.
+        Derives the path from ``_config.transient.report_filename`` when
+        available (tied to the ``garak.<run_id>.report.jsonl`` convention in
+        ``garak.command``), otherwise falls back to a timestamped file in cwd.
         """
-        if not attempts or self.primary_detector == "always.Fail":
-            return
         try:
-            detector = _plugins.load_plugin(f"detectors.{self.primary_detector}")
-        except Exception as exc:
-            logging.debug(
-                "%s: could not load detector for combo summary: %s",
-                self.__class__.__name__,
-                exc,
-            )
-            return
+            report_filename = getattr(_config.transient, "report_filename", None)
+        except AttributeError:
+            report_filename = None
+        if report_filename:
+            p = pathlib.Path(report_filename)
+            name = p.name
+            if name.endswith(".report.jsonl"):
+                index_name = name[: -len(".report.jsonl")] + ".hyperparam_index.json"
+            else:
+                index_name = name + ".hyperparam_index.json"
+            return p.parent / index_name
+        index_path = (
+            pathlib.Path.cwd()
+            / f"hyperparam_index_{datetime.now().strftime('%Y%m%dT%H%M%S')}.json"
+        )
+        logging.info(
+            "%s: no active report path; writing combo index to %s",
+            self.__class__.__name__,
+            index_path,
+        )
+        return index_path
 
-        combo_stats: dict[str, dict[str, int]] = {}
+    def _write_combo_index(
+        self, attempts: list[Attempt], index_path: pathlib.Path
+    ) -> None:
+        """Write a sidecar JSON index mapping each parameter combo to attempt UUIDs.
+
+        Use ``python -m garak.analyze.hyperparam_summary`` to produce a
+        per-combo pass/fail summary from the JSONL report after the run.
+        """
+        index: dict[str, list[str]] = {}
         for attempt in attempts:
-            combo_key = str(attempt.notes.get("hyperparam_combo", {}))
-            combo_stats.setdefault(combo_key, {"pass": 0, "fail": 0})
-            try:
-                results = detector.detect(attempt)
-                attempt.notes["hyperparam_detector_results"] = results
-                for r in results:
-                    if r:
-                        combo_stats[combo_key]["pass"] += 1
-                    else:
-                        combo_stats[combo_key]["fail"] += 1
-            except Exception as exc:
-                logging.debug(
-                    "%s: detection failed for attempt: %s",
-                    self.__class__.__name__,
-                    exc,
-                )
-
-        logging.info("%s — per-combo detection summary:", self.__class__.__name__)
-        if not (hasattr(_config, "system") and getattr(_config.system, "narrow_output", False)):
-            print(f"\n{self.__class__.__name__} — per-combo detection summary:")
-        for combo_key, stats in sorted(combo_stats.items()):
-            total = stats["pass"] + stats["fail"]
-            rate = 100 * stats["pass"] / total if total else 0
-            logging.info(
-                "  %s → %d/%d failed (%.0f%% attack success rate)",
-                combo_key,
-                stats["fail"],
-                total,
-                rate,
-            )
-            if not (hasattr(_config, "system") and getattr(_config.system, "narrow_output", False)):
-                print(f"  {combo_key} → {stats['fail']}/{total} failed ({rate:.0f}% attack success rate)")
+            combo = attempt.notes.get("hyperparam_combo", {})
+            key = json.dumps(combo, sort_keys=True)
+            index.setdefault(key, []).append(str(attempt.uuid))
+        index_path.write_text(
+            json.dumps(index, separators=(",", ":")), encoding="utf-8"
+        )
+        logging.info(
+            "%s: combo index written to %s", self.__class__.__name__, index_path
+        )
 
     def _build_prompt_list(self) -> list:
         """Return the cross-product of prompts × parameter combos."""
@@ -465,5 +457,17 @@ class HyperparamBasher(garak.probes.Probe):
             self.prompts = original_prompts
             self._param_combos = original_combos
 
-        self._summarise_by_combo(result)
+        index_path = self._resolve_combo_index_path()
+        self._write_combo_index(result, index_path)
+        if not (hasattr(_config, "system") and getattr(_config.system, "narrow_output", False)):
+            try:
+                report = getattr(_config.transient, "report_filename", None)
+            except AttributeError:
+                report = None
+            report_hint = f" --report {report}" if report else ""
+            print(
+                f"\n{self.__class__.__name__}: run"
+                f" `python -m garak.analyze.hyperparam_summary{report_hint}`"
+                " to view per-combo results."
+            )
         return result

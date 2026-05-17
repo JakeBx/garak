@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import json
+import uuid
 import pytest
 from unittest.mock import MagicMock
 
 import garak._config
-from garak import _plugins
+from garak import _config, _plugins
 import garak.probes.hyperparams
 from garak.exception import PluginConfigurationError
 from garak.probes.hyperparams import HyperparamBasher
@@ -589,108 +591,68 @@ def test_prompt_count_respects_cap():
 
 
 # ---------------------------------------------------------------------------
-# _summarise_by_combo
+# _write_combo_index / _resolve_combo_index_path
 # ---------------------------------------------------------------------------
 
 
-def test_summarise_by_combo_noop_on_empty_attempts():
-    """_summarise_by_combo returns cleanly with no attempts."""
+def test_write_combo_index_creates_file(tmp_path):
+    """_write_combo_index writes a JSON file at the given path."""
     probe = HyperparamBasher()
-    probe._summarise_by_combo([])  # should not raise
+    index_path = tmp_path / "test_index.json"
+    mock_attempt = MagicMock()
+    mock_attempt.uuid = uuid.uuid4()
+    mock_attempt.notes = {"hyperparam_combo": {"temperature": 0.5}}
+    probe._write_combo_index([mock_attempt], index_path)
+    assert index_path.exists()
 
 
-def test_summarise_by_combo_noop_for_always_fail_detector():
-    """_summarise_by_combo skips detection when primary_detector is always.Fail."""
+def test_write_combo_index_valid_content(tmp_path):
+    """_write_combo_index writes correct combo keys and attempt UUIDs."""
+    probe = HyperparamBasher()
+    index_path = tmp_path / "test_index.json"
+    uid1, uid2 = uuid.uuid4(), uuid.uuid4()
+    a1 = MagicMock()
+    a1.uuid = uid1
+    a1.notes = {"hyperparam_combo": {"temperature": 0.5}}
+    a2 = MagicMock()
+    a2.uuid = uid2
+    a2.notes = {"hyperparam_combo": {"temperature": 1.5}}
+    probe._write_combo_index([a1, a2], index_path)
+    index = json.loads(index_path.read_text())
+    key1 = json.dumps({"temperature": 0.5}, sort_keys=True)
+    key2 = json.dumps({"temperature": 1.5}, sort_keys=True)
+    assert key1 in index and str(uid1) in index[key1]
+    assert key2 in index and str(uid2) in index[key2]
+
+
+def test_write_combo_index_empty_attempts(tmp_path):
+    """_write_combo_index with empty attempt list writes an empty JSON object."""
+    probe = HyperparamBasher()
+    index_path = tmp_path / "empty_index.json"
+    probe._write_combo_index([], index_path)
+    assert index_path.exists()
+    assert json.loads(index_path.read_text()) == {}
+
+
+def test_resolve_combo_index_path_with_config(tmp_path):
+    """When report_filename is set, index path is co-located with the report."""
     from unittest.mock import patch
 
-    probe = HyperparamBasher()
-    # primary_detector defaults to "always.Fail" when no source_probe is set
-    assert probe.primary_detector == "always.Fail"
-    with patch("garak.probes.hyperparams._plugins") as mock_plugins:
-        probe._summarise_by_combo([MagicMock()])
-        mock_plugins.load_plugin.assert_not_called()
+    fake_report = str(tmp_path / "garak.abc123.report.jsonl")
+    with patch.object(_config, "transient", create=True) as mock_t:
+        mock_t.report_filename = fake_report
+        probe = HyperparamBasher()
+        result = probe._resolve_combo_index_path()
+    assert result == tmp_path / "garak.abc123.hyperparam_index.json"
 
 
-def test_summarise_by_combo_stores_results_in_notes():
-    """Detection results are stored in attempt.notes["hyperparam_detector_results"]."""
-    from unittest.mock import patch, MagicMock
+def test_resolve_combo_index_path_fallback():
+    """When report_filename is None, index path is in cwd with a timestamp name."""
+    from unittest.mock import patch
 
-    config_root = {
-        "probes": {
-            "hyperparams": {
-                "HyperparamBasher": {
-                    "source_probe": "packagehallucination.Python",
-                    "param_space": {"temperature": [0.5]},
-                }
-            }
-        }
-    }
-    probe = HyperparamBasher(config_root=config_root)
-
-    from garak.attempt import Attempt, Message, Conversation, Turn
-
-    attempt = Attempt(
-        prompt=Conversation([Turn("user", Message(text="pip install requests"))]),
-        probe_classname="hyperparams.HyperparamBasher",
-    )
-    attempt.outputs = [MagicMock(text="pip install requests")]
-    attempt.notes["hyperparam_combo"] = {"temperature": 0.5}
-
-    mock_detector = MagicMock()
-    mock_detector.detect.return_value = [True, False]
-
-    with patch("garak.probes.hyperparams._plugins") as mock_plugins:
-        mock_plugins.load_plugin.return_value = mock_detector
-        probe._summarise_by_combo([attempt])
-
-    assert "hyperparam_detector_results" in attempt.notes
-    assert attempt.notes["hyperparam_detector_results"] == [True, False]
-
-
-def test_summarise_by_combo_logs_summary(caplog):
-    """_summarise_by_combo emits an INFO log with per-combo pass/fail rates."""
-    import logging
-    from unittest.mock import patch, MagicMock
-
-    config_root = {
-        "probes": {
-            "hyperparams": {
-                "HyperparamBasher": {
-                    "source_probe": "packagehallucination.Python",
-                    "param_space": {"temperature": [0.5]},
-                }
-            }
-        }
-    }
-    probe = HyperparamBasher(config_root=config_root)
-
-    from garak.attempt import Attempt, Message, Conversation, Turn
-
-    def make_attempt(temp, results):
-        a = Attempt(
-            prompt=Conversation([Turn("user", Message(text="test"))]),
-            probe_classname="hyperparams.HyperparamBasher",
-        )
-        a.outputs = [MagicMock(text="test")]
-        a.notes["hyperparam_combo"] = {"temperature": temp}
-        return a, results
-
-    attempts_and_results = [
-        make_attempt(0.0, [True, True]),
-        make_attempt(2.0, [False, False]),
-    ]
-    attempts = [a for a, _ in attempts_and_results]
-    result_map = {id(a): r for a, r in attempts_and_results}
-
-    mock_detector = MagicMock()
-    mock_detector.detect.side_effect = lambda a: result_map[id(a)]
-
-    with patch("garak.probes.hyperparams._plugins") as mock_plugins:
-        mock_plugins.load_plugin.return_value = mock_detector
-        with caplog.at_level(logging.INFO, logger="garak.probes.hyperparams"):
-            probe._summarise_by_combo(attempts)
-
-    log_text = "\n".join(caplog.messages)
-    assert "per-combo detection summary" in log_text
-    assert "{'temperature': 0.0}" in log_text
-    assert "{'temperature': 2.0}" in log_text
+    with patch.object(_config, "transient", create=True) as mock_t:
+        mock_t.report_filename = None
+        probe = HyperparamBasher()
+        result = probe._resolve_combo_index_path()
+    assert result.name.startswith("hyperparam_index_")
+    assert result.suffix == ".json"
